@@ -136,28 +136,19 @@ def create_gh_output_param(param_def, default_description="Output parameter"):
 
 # --- Grasshopper Object Information Functions (Based on GHCodeMCP_old_working.py, with improvements) ---
 
-def get_param_info(param, is_input=True, parent_instance_guid=None, is_selected=False):
+def get_param_info(param, is_input=True, parent_instance_guid=None, is_selected=False, simplified=False):
     """Collect detailed information from a Grasshopper parameter.
        Based on GHCodeMCP_old_working.py's structure, with Y-inversion and parent GUID.
+       Includes a simplified mode.
     """
     guid_str = str(param.InstanceGuid)
     parent_guid_str = str(parent_instance_guid) if parent_instance_guid else None
     nick_name = param.NickName or param.Name # Prefer NickName
 
-    # Initialize with default values
-    bounds_rect = {}
-    pivot_pt = {}
+    # Calculate sources and targets regardless of simplified mode for consistency
     sources_list = []
     targets_list = []
-
     try:
-        if hasattr(param, "Attributes") and param.Attributes:
-            bounds = param.Attributes.Bounds
-            # Use Y inversion for screen coords
-            bounds_rect = RectangleF(bounds.X, (bounds.Y * -1) - bounds.Height, bounds.Width, bounds.Height)
-            # Use Y inversion for pivot
-            pivot_pt = rg.Point3d(param.Attributes.Pivot.X, param.Attributes.Pivot.Y * -1, 0)
-
         # Get sources (inputs to this param)
         if hasattr(param, "Sources"):
             sources_list = [str(src.InstanceGuid) for src in param.Sources if src]
@@ -173,6 +164,39 @@ def get_param_info(param, is_input=True, parent_instance_guid=None, is_selected=
             else: # Output param's source is its parent component
                  if parent_guid_str not in sources_list:
                      sources_list.append(parent_guid_str)
+    except Exception as e_conn:
+        # Log connection error simply
+        error_msg = "Error getting connections for param {}: {}".format(guid_str, e_conn)
+        existing_error = sc.sticky.get("processing_error", "")
+        sc.sticky["processing_error"] = (existing_error + "\n" + error_msg).strip()
+
+    if simplified:
+        # Return minimal info focusing on identity and connectivity
+        info = {
+            "instanceGuid": guid_str,
+            "parentInstanceGuid": parent_guid_str,
+            "name": param.Name,
+            "nickName": nick_name,
+            "kind": "parameter", # Simplified kind identifier
+            "sources": sources_list,
+            "targets": targets_list,
+            "isSelected": is_selected,
+            "isInput": is_input,
+        }
+        return info
+
+    # --- Detailed Parameter Information ---
+    # Initialize with default values
+    bounds_rect = {}
+    pivot_pt = {}
+
+    try:
+        if hasattr(param, "Attributes") and param.Attributes:
+            bounds = param.Attributes.Bounds
+            # Use Y inversion for screen coords
+            bounds_rect = RectangleF(bounds.X, (bounds.Y * -1) - bounds.Height, bounds.Width, bounds.Height)
+            # Use Y inversion for pivot
+            pivot_pt = rg.Point3d(param.Attributes.Pivot.X, param.Attributes.Pivot.Y * -1, 0)
 
         param_info = {
             "instanceGuid": guid_str,
@@ -185,8 +209,8 @@ def get_param_info(param, is_input=True, parent_instance_guid=None, is_selected=
             "subCategory": param.SubCategory if hasattr(param, "SubCategory") else None,
             "description": param.Description,
             "kind": "parameter", # Identify type simply
-            "sources": sources_list,
-            "targets": targets_list,
+            "sources": sources_list, # Already calculated
+            "targets": targets_list, # Already calculated
             "isSelected": is_selected,
             "isInput": is_input, # Indicate if it's an input/output of a component
             # Properties specific to IGH_Param (use get_access_string for consistency)
@@ -206,7 +230,7 @@ def get_param_info(param, is_input=True, parent_instance_guid=None, is_selected=
             except Exception:
                 param_info["dataTypeHint"] = "N/A"
 
-        # Specific handling for standalone params like sliders/panels
+        # Specific handling for standalone params like sliders/panels (even in detailed mode)
         if not parent_guid_str:
             if isinstance(param, Grasshopper.Kernel.Special.GH_NumberSlider):
                 param_info["kind"] = "slider"
@@ -229,16 +253,17 @@ def get_param_info(param, is_input=True, parent_instance_guid=None, is_selected=
 
     except Exception as e:
         # Log error simply, don't wrap everything in try/except
-        error_msg = "Error getting param info for {}: {}".format(guid_str, e)
+        error_msg = "Error getting detailed param info for {}: {}".format(guid_str, e)
         # Use sticky for persistent logging accessible by main thread
         existing_error = sc.sticky.get("processing_error", "")
         sc.sticky["processing_error"] = (existing_error + "\n" + error_msg).strip()
         return None # Return None on failure
 
 
-def get_component_info(comp, is_selected=False):
+def get_component_info(comp, is_selected=False, simplified=False):
     """Collect detailed information from a Grasshopper component.
        Based on GHCodeMCP_old_working.py structure, with Y-inversion and selected flag.
+       Includes a simplified mode.
     """
     guid_str = str(comp.InstanceGuid)
     nick_name = comp.NickName or comp.Name # Prefer NickName
@@ -246,30 +271,70 @@ def get_component_info(comp, is_selected=False):
     # Initialize with defaults
     bounds_rect = {}
     pivot_pt = {}
-    input_param_info = []
-    output_param_info = []
     aggregated_sources = set()
     aggregated_targets = set()
     runtime_messages = []
+    param_guids = set() # Used for filtering aggregated sources/targets
 
     try:
         # Component Kind
         kind = str(comp.Kind) if hasattr(comp, 'Kind') else str(comp.__class__.__name__)
 
+        # --- Calculate pivot, runtime messages, aggregated sources/targets for both modes ---
+        if hasattr(comp, "Attributes") and comp.Attributes:
+            # Use Y inversion for pivot
+            pivot_pt = rg.Point3d(comp.Attributes.Pivot.X, comp.Attributes.Pivot.Y * -1, 0)
+
+        try:
+            messages =  comp.RuntimeMessages(comp.RuntimeMessageLevel) # Get warnings and errors
+            runtime_messages = [str(m) for m in messages] if messages else []
+        except:
+            pass # Keep empty list on error
+
+        # Aggregate sources/targets from component parameters
+        if hasattr(comp, "Params"):
+            if hasattr(comp.Params, "Input"):
+                for p in comp.Params.Input:
+                    p_guid = str(p.InstanceGuid)
+                    param_guids.add(p_guid)
+                    # Need sources from the parameter itself to aggregate
+                    param_info_temp = get_param_info(p, is_input=True, parent_instance_guid=comp.InstanceGuid, simplified=True) # Use simplified=True here for efficiency
+                    if param_info_temp:
+                         aggregated_sources.update(param_info_temp.get("sources", []))
+            if hasattr(comp.Params, "Output"):
+                for p in comp.Params.Output:
+                    p_guid = str(p.InstanceGuid)
+                    param_guids.add(p_guid)
+                    param_info_temp = get_param_info(p, is_input=False, parent_instance_guid=comp.InstanceGuid, simplified=True) # Use simplified=True here for efficiency
+                    if param_info_temp:
+                         aggregated_targets.update(param_info_temp.get("targets", []))
+
+        # Filter out the component's own parameters' GUIDs and itself
+        final_sources = list(s for s in aggregated_sources if s != guid_str and s not in param_guids)
+        final_targets = list(t for t in aggregated_targets if t != guid_str and t not in param_guids)
+
+
+        if simplified:
+            # Return minimal info focusing on identity, connectivity, and status
+            info = {
+                "instanceGuid": guid_str,
+                "name": comp.Name,
+                "nickName": nick_name,
+                "description": comp.Description,
+                "kind": kind,
+                "pivot": pivot_pt, # Include simplified pivot
+                "sources": final_sources,
+                "targets": final_targets,
+                "isSelected": is_selected,
+                "runtimeMessages": runtime_messages # Include runtime messages
+            }
+            return info
+
+        # --- Detailed Component Information ---
         if hasattr(comp, "Attributes") and comp.Attributes:
             bounds = comp.Attributes.Bounds
             # Use Y inversion
             bounds_rect = RectangleF(bounds.X, (bounds.Y * -1) - bounds.Height, bounds.Width, bounds.Height)
-            # Use Y inversion
-            pivot_pt = rg.Point3d(comp.Attributes.Pivot.X, comp.Attributes.Pivot.Y * -1, 0)
-
-        # Runtime messages
-        try:
-
-            messages = comp.RuntimeMessages(comp.RuntimeMessageLevel)
-            runtime_messages = [str(m) for m in messages] if messages else []
-        except:
-            pass # Keep empty list on error
 
         comp_info = {
             "instanceGuid": guid_str,
@@ -279,15 +344,15 @@ def get_component_info(comp, is_selected=False):
             "category": comp.Category if hasattr(comp, "Category") else None,
             "subCategory": comp.SubCategory if hasattr(comp, "SubCategory") else None,
             "kind": kind,
-            "bounds": bounds_rect,
-            "pivot": pivot_pt,
+            "bounds": bounds_rect, # Detailed bounds
+            "pivot": pivot_pt, # Already calculated
             "isSelected": is_selected,
-            "computationTime": float(comp.ProcessorTime.Milliseconds) if hasattr(comp, "ProcessorTime") else 0.0, # Keep this from newer
-            "runtimeMessages": runtime_messages,
-            "Inputs": [], # Use "Inputs"/"Outputs" like old script for compatibility?
+            "computationTime": float(comp.ProcessorTime.Milliseconds) if hasattr(comp, "ProcessorTime") else 0.0,
+            "runtimeMessages": runtime_messages, # Already calculated
+            "Inputs": [], # Use "Inputs"/"Outputs" like old script for compatibility? -> Yes
             "Outputs": [],
-            "sources": [], # Aggregated sources of component itself
-            "targets": [], # Aggregated targets of component itself
+            "sources": final_sources, # Already calculated
+            "targets": final_targets, # Already calculated
         }
 
         # Script Component Specific Info (adapted from GHCodeMCP.py)
@@ -314,31 +379,19 @@ def get_component_info(comp, is_selected=False):
                          sc.sticky["processing_error"] = (existing_error + "\n" + error_msg).strip()
 
 
-        # Get detailed input and output parameter info
+        # Get detailed input and output parameter info (only in detailed mode)
         if hasattr(comp, "Params"):
             if hasattr(comp.Params, "Input"):
                 for p in comp.Params.Input:
-                    # Pass is_selected status down to params? No, param selection is different.
-                    # Let is_selected apply only to the main component/standalone param.
-                    param_info = get_param_info(p, is_input=True, parent_instance_guid=comp.InstanceGuid, is_selected=False)
+                    # Call get_param_info with simplified=False for detailed output
+                    param_info = get_param_info(p, is_input=True, parent_instance_guid=comp.InstanceGuid, is_selected=False, simplified=False)
                     if param_info:
                          comp_info["Inputs"].append(param_info)
-                         # Aggregate sources from input parameters' sources
-                         aggregated_sources.update(param_info.get("sources", []))
             if hasattr(comp.Params, "Output"):
                 for p in comp.Params.Output:
-                    param_info = get_param_info(p, is_input=False, parent_instance_guid=comp.InstanceGuid, is_selected=False)
+                    param_info = get_param_info(p, is_input=False, parent_instance_guid=comp.InstanceGuid, is_selected=False, simplified=False)
                     if param_info:
                          comp_info["Outputs"].append(param_info)
-                         # Aggregate targets from output parameters' targets
-                         aggregated_targets.update(param_info.get("targets", []))
-
-        # Assign aggregated sources/targets to the component itself
-        # Filter out the component's own parameters' GUIDs from the aggregated lists
-        # Filter out the component itself from sources/targets
-        param_guids = set([p_info["instanceGuid"] for p_info in comp_info["Inputs"]] + [p_info["instanceGuid"] for p_info in comp_info["Outputs"]])
-        comp_info["sources"] = list(s for s in aggregated_sources if s != guid_str and s not in param_guids)
-        comp_info["targets"] = list(t for t in aggregated_targets if t != guid_str and t not in param_guids)
 
         return comp_info
 
@@ -378,10 +431,11 @@ def expire_grasshopper_component(doc, instance_guid_str):
 
 
 
-def get_all_relevant_objects_info(doc, selected_guids_set=None):
+def get_all_relevant_objects_info(doc, selected_guids_set=None, simplified=False):
     """
     Collects info for all components and standalone parameters in the document.
     Returns a dictionary keyed by instance GUID. Marks selection status.
+    Includes a simplified mode.
     """
     graph = {}
     if selected_guids_set is None:
@@ -395,13 +449,13 @@ def get_all_relevant_objects_info(doc, selected_guids_set=None):
         info = None
 
         if isinstance(obj, Grasshopper.Kernel.IGH_Component):
-            info = get_component_info(obj, is_selected=is_selected)
+            info = get_component_info(obj, is_selected=is_selected, simplified=simplified)
         elif isinstance(obj, Grasshopper.Kernel.IGH_Param):
             # Only include standalone parameters at the top level
             parent_comp = obj.Attributes.Parent if hasattr(obj, "Attributes") and obj.Attributes else None
             if not parent_comp:
                 # Use get_param_info directly for standalone params
-                info = get_param_info(obj, is_input=False, parent_instance_guid=None, is_selected=is_selected)
+                info = get_param_info(obj, is_input=False, parent_instance_guid=None, is_selected=is_selected, simplified=simplified)
 
         if info:
             graph[guid_str] = info
@@ -409,7 +463,7 @@ def get_all_relevant_objects_info(doc, selected_guids_set=None):
     return graph
 
 
-def get_objects_with_context(target_guids, context_depth=0):
+def get_objects_with_context(target_guids, context_depth=0, simplified=False):
     """
     Get info for target objects and their context (neighbors).
     Focuses on components and standalone parameters.
@@ -422,8 +476,8 @@ def get_objects_with_context(target_guids, context_depth=0):
 
     target_guids_set = set(str(g) for g in target_guids)
 
-    # 1. Get info for *all* relevant objects first
-    all_objects_info = get_all_relevant_objects_info(doc, selected_guids_set=target_guids_set)
+    # 1. Get info for *all* relevant objects first, passing simplified flag
+    all_objects_info = get_all_relevant_objects_info(doc, selected_guids_set=target_guids_set, simplified=simplified)
 
     # 2. Identify the initial set of objects to include (the targets)
     result_graph = {}
@@ -480,10 +534,97 @@ def get_objects_with_context(target_guids, context_depth=0):
     # relying on the order Grasshopper presents objects or the dictionary order.
     return result_graph
 
-def get_selected_objects(context_depth=0):
+
+def get_object_by_instance_guid(doc, instance_guid):
+    """
+    Helper function to get an object from document by instance GUID string.
+
+    Args:
+        doc: Grasshopper document
+        instance_guid: Instance GUID string
+
+    Returns:
+        Grasshopper object if found, None otherwise
+    """
+    try:
+        import System
+        if isinstance(instance_guid, str):
+            instance_guid = System.Guid(instance_guid)
+
+        for obj in doc.Objects:
+            if obj.InstanceGuid == instance_guid:
+                return obj
+    except:
+        pass
+
+    return None
+
+def sort_graph_by_execution_order(graph):
+    """
+    Sort the graph dictionary by component execution order.
+
+    Args:
+        graph: The graph dictionary containing component and parameter information
+
+    Returns:
+        A new graph dictionary with keys ordered by execution sequence
+    """
+    # Create a dictionary to store in-degrees (number of incoming edges)
+    in_degree = {node_id: 0 for node_id in graph}
+
+    # Calculate in-degree for each node
+    for node_id, node_info in graph.items():
+        if "targets" in node_info:
+            for target_id in node_info["targets"]:
+                if target_id in in_degree:
+                    in_degree[target_id] += 1
+
+    # Queue with nodes that have no incoming edges (in-degree = 0)
+    queue = [node_id for node_id, degree in in_degree.items() if degree == 0]
+
+    # List to store the sorted order
+    sorted_order = []
+
+    # Process nodes in the queue
+    while queue:
+        # Get the next node
+        current_id = queue.pop(0)
+        sorted_order.append(current_id)
+
+        # Reduce in-degree of all targets (downstream components)
+        if "targets" in graph[current_id]: # Check if graph[current_id] exists and has "targets"
+            for target_id in graph[current_id]["targets"]:
+                if target_id in in_degree: # Check if target_id is a valid key in in_degree
+                    in_degree[target_id] -= 1
+                    # If in-degree becomes 0, add to queue
+                    if in_degree[target_id] == 0:
+                        queue.append(target_id)
+
+    # For any remaining nodes (cycles or unreachable), add to the end
+    # Ensure all original keys from the graph are included if not sorted (handles cycles)
+    remaining_nodes = [node_id for node_id in graph if node_id not in sorted_order]
+    sorted_order.extend(remaining_nodes)
+
+    # Create a new ordered dictionary
+    # Use collections.OrderedDict if Python 2.x IronPython environment for guaranteed order
+    # For Python 3.7+ dicts preserve insertion order, but being explicit is safer in older/cross-Python contexts
+    try:
+        from collections import OrderedDict
+        ordered_graph = OrderedDict()
+    except ImportError: # Fallback for environments where OrderedDict might not be standard (e.g. very old IronPython)
+        ordered_graph = {} # Standard dict, order might not be guaranteed below Python 3.7
+
+    for node_id in sorted_order:
+        if node_id in graph: # Ensure node_id is actually in the original graph
+            ordered_graph[node_id] = graph[node_id]
+
+    return ordered_graph
+
+def get_selected_objects(context_depth=0, simplified=False):
     """
     Get currently selected objects in the Grasshopper document with context.
     Returns dictionary: {"status": "...", "result": ...}
+    Includes a simplified mode.
     """
     doc = ghenv.Component.OnPingDocument()
     if not doc:
@@ -502,8 +643,8 @@ def get_selected_objects(context_depth=0):
         return {"status": "success", "result": {}} # No objects selected
 
     try:
-        # Use the context retrieval function
-        objects_dict = get_objects_with_context(selected_guids, context_depth=context_depth)
+        # Use the context retrieval function, passing simplified flag
+        objects_dict = get_objects_with_context(selected_guids, context_depth=context_depth, simplified=simplified)
         return {"status": "success", "result": objects_dict}
     except Exception as e:
         error_msg = "Error getting selected objects: {}".format(e)
@@ -512,10 +653,11 @@ def get_selected_objects(context_depth=0):
         return {"status": "error", "result": error_msg}
 
 
-def get_grasshopper_context():
+def get_grasshopper_context(simplified=False):
     """
     Get information about *all* components and *standalone* parameters in the document.
     Returns dictionary: {"status": "...", "result": ...}
+    Includes a simplified mode.
     """
     doc = ghenv.Component.OnPingDocument()
     if not doc:
@@ -523,9 +665,9 @@ def get_grasshopper_context():
         return {"status": "error", "result": "No active Grasshopper document."}
 
     try:
-        # Use the core info gathering function, passing no specific selections
-        # (it will determine selection status internally)
-        all_info = get_all_relevant_objects_info(doc)
+        # Use the core info gathering function, passing simplified flag
+        # It determines selection status internally based on the document state.
+        all_info = get_all_relevant_objects_info(doc, simplified=simplified)
         return {"status": "success", "result": all_info}
     except Exception as e:
         error_msg = "Error getting full context: {}".format(e)
@@ -1124,9 +1266,11 @@ def process_command(command_data):
 
         # --- Get Context (Full Document Graph) ---
         elif command_type == "get_context":
-            context_result = get_grasshopper_context() # Simplified: no simplified flag for now
-            # Returns dict with status/result
-            return context_result
+            simplified = command_data.get("simplified", False) # Get simplified flag
+            context_result_dict = get_grasshopper_context(simplified=simplified) # Pass simplified flag
+            if context_result_dict.get("status") == "success" and context_result_dict.get("result"):
+                context_result_dict["result"] = sort_graph_by_execution_order(context_result_dict["result"])
+            return context_result_dict
 
         # --- Expire Component and Get Info ---
         elif command_type == "expire_component":
@@ -1155,16 +1299,18 @@ def process_command(command_data):
                 return {"status": "error", "result": "No instance GUID(s) provided."}
 
             context_depth = command_data.get("context_depth", 0)
+            simplified = command_data.get("simplified", False) # Get simplified flag
             try: # Validate depth
                 context_depth = int(context_depth)
                 context_depth = max(0, min(context_depth, 3))
             except:
                 context_depth = 0
 
-            objects_result = get_objects_with_context(instance_guids, context_depth=context_depth)
-            # get_objects_with_context returns the dictionary directly or {}
-            if objects_result:
-                return {"status": "success", "result": objects_result}
+            objects_dict = get_objects_with_context(instance_guids, context_depth=context_depth, simplified=simplified) # Pass simplified flag
+
+            if objects_dict or isinstance(objects_dict, dict): # Check if it returned a dictionary (even empty)
+                sorted_objects_dict = sort_graph_by_execution_order(objects_dict) if objects_dict else {}
+                return {"status": "success", "result": sorted_objects_dict}
             else:
                 # Check if an error was logged during retrieval
                 proc_error = sc.sticky.get("processing_error", "")
@@ -1177,15 +1323,17 @@ def process_command(command_data):
         # --- Get Selected Object(s) with Context ---
         elif command_type == "get_selected":
             context_depth = command_data.get("context_depth", 0)
+            simplified = command_data.get("simplified", False) # Get simplified flag
             try: # Validate depth
                 context_depth = int(context_depth)
                 context_depth = max(0, min(context_depth, 3))
             except:
                 context_depth = 0
 
-            selected_result = get_selected_objects(context_depth=context_depth)
-            # Returns dict with status/result
-            return selected_result
+            selected_result_dict = get_selected_objects(context_depth=context_depth, simplified=simplified) # Pass simplified flag
+            if selected_result_dict.get("status") == "success" and selected_result_dict.get("result"):
+                selected_result_dict["result"] = sort_graph_by_execution_order(selected_result_dict["result"])
+            return selected_result_dict
 
         # --- Update Script Component (Code, Params, Desc) ---
         elif command_type == "update_script":
